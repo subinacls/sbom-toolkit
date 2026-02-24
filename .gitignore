@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ── SBOM Toolkit output directories ──
+sbom_*/
+
+# Backup directories
+backup/
+
+# Test data (raw package files, intermediate SBOMs)
+*.sbom
+rpm.txt
+pip_packages.txt
