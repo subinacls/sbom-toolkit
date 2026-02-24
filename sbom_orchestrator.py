@@ -19,9 +19,14 @@ This module provides a fully autonomous pipeline that:
 
 Authentication modes:
     * **SSH key** (``--key``):  Direct path to a private key.
+    * **Interactive password** (``--ask-pass``): Secure prompt via ``getpass``
+      — password never appears in shell history or process listings.
     * **Password** (``--password``): Via ``sshpass`` (must be installed).
+      Note: visible in process list / shell history.
     * **SSH agent / config**: If neither ``--key`` nor ``--password`` is
       given, the script falls back to ``ssh-agent`` or ``~/.ssh/config``.
+    * **Auto-prompt on failure**: If key/agent auth fails and no password
+      was given, the user is prompted interactively before aborting.
 
 Requirements:
     * ``ssh`` / ``scp`` on the local machine.
@@ -36,7 +41,10 @@ Quick start::
     # SSH key auth:
     python3 sbom_orchestrator.py --host 10.20.0.5 --user root --key ~/.ssh/id_rsa
 
-    # Password auth:
+    # Secure interactive password prompt (never in history):
+    python3 sbom_orchestrator.py --host 10.20.0.5 --user admin --ask-pass
+
+    # Password auth (inline — visible in history):
     python3 sbom_orchestrator.py --host 10.20.0.5 --user admin --password 'S3cret!'
 
     # Via jump host with sudo discovery:
@@ -68,6 +76,7 @@ __author__ = "SBOM Toolkit Contributors"
 __license__ = "MIT"
 
 import argparse
+import getpass
 import json
 import os
 import subprocess
@@ -128,6 +137,8 @@ class RemoteHost:
         2. Explicit ``--key`` → ``ssh -i <key>``.
         3. No flags → ``BatchMode=yes``, relying on ``ssh-agent`` /
            ``~/.ssh/config``.
+        4. If all above fail → interactive password prompt via ``getpass``
+           (avoids password exposure in shell history / process listings).
 
     Args:
         host:           Hostname or IP of the target.
@@ -1106,7 +1117,10 @@ Examples:
   # SSH key auth:
   %(prog)s --host 10.20.0.5 --user root --key ~/.ssh/id_rsa
 
-  # Password auth:
+  # Password auth (prompted securely — password never in shell history):
+  %(prog)s --host 10.20.0.5 --user admin --ask-pass
+
+  # Password auth (inline — less secure, visible in history):
   %(prog)s --host 10.20.0.5 --user admin --password 'S3cret!'
 
   # Via a jump/bastion server:
@@ -1134,7 +1148,9 @@ Examples:
     )
     parser.add_argument("--host", required=True, help="Remote host IP or hostname")
     parser.add_argument("--user", required=True, help="SSH username")
-    parser.add_argument("--password", default=None, help="SSH password (requires sshpass)")
+    parser.add_argument("--password", default=None, help="SSH password (requires sshpass) — visible in process list/history")
+    parser.add_argument("--ask-pass", action="store_true",
+                        help="Prompt for SSH password interactively (secure — never stored in history)")
     parser.add_argument("--key", default=None, help="Path to SSH private key")
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
     parser.add_argument("-J", "--jump", default=None,
@@ -1158,6 +1174,14 @@ Examples:
                         help="Use sudo on remote for privileged discovery "
                              "(read all users' home dirs, pyenv, pipx, etc.)")
     args = parser.parse_args()
+
+    # ── Interactive password prompt (--ask-pass) ─────────────────────
+    if args.ask_pass:
+        if args.password:
+            print("Warning: --ask-pass overrides --password", file=sys.stderr)
+        args.password = getpass.getpass(
+            prompt=f"SSH password for {args.user}@{args.host}: "
+        )
 
     if not args.password and not args.key:
         # No explicit key or password — check common defaults, then fall
@@ -1211,9 +1235,42 @@ Examples:
     print("\n[1/5] Testing SSH connectivity...")
     rc, stdout, stderr = remote.run("echo OK")
     if rc != 0 or "OK" not in stdout:
-        print(f"FATAL: Cannot connect to {args.host}: {stderr.strip()}", file=sys.stderr)
-        sys.exit(1)
-    print("  SSH connection successful")
+        # ── Offer interactive password prompt on failure ───────────
+        if not args.password and not args.ask_pass:
+            print(f"  SSH connection failed: {stderr.strip()}")
+            print("  Prompting for password (will not be stored in history)...")
+            try:
+                pwd = getpass.getpass(
+                    prompt=f"SSH password for {args.user}@{args.host}: "
+                )
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.", file=sys.stderr)
+                sys.exit(1)
+            if pwd:
+                args.password = pwd
+                remote = RemoteHost(
+                    host=args.host, user=args.user,
+                    password=args.password, key=args.key, port=args.port,
+                    jump=args.jump, jump_key=args.jump_key,
+                    jump_password=args.jump_password,
+                )
+                rc, stdout, stderr = remote.run("echo OK")
+                if rc != 0 or "OK" not in stdout:
+                    print(f"FATAL: Cannot connect to {args.host}: {stderr.strip()}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                auth_method = 'password (interactive)'
+                print(f"  SSH connection successful (password auth)")
+            else:
+                print(f"FATAL: Cannot connect to {args.host}: {stderr.strip()}",
+                      file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"FATAL: Cannot connect to {args.host}: {stderr.strip()}",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        print("  SSH connection successful")
 
     # ── Detect OS ─────────────────────────────────────────────────────
     print("\n[2/5] Detecting remote OS...")

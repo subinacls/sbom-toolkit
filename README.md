@@ -18,7 +18,7 @@ standard library.
 | **14 converter scripts** | RPM, dpkg, APT, APK, YUM/DNF, Snap, pip, gem, npm, Go, Cargo, Composer, Maven/Gradle, NuGet |
 | **Autonomous orchestrator** | One command discovers, extracts, converts, and scans an entire remote host |
 | **SSH jump-host / bastion** | Native `ProxyJump` support — single-hop or multi-hop chains |
-| **Flexible auth** | SSH key, password (`sshpass`), or agent / `~/.ssh/config` |
+| **Flexible auth** | SSH key, interactive password prompt (`--ask-pass`), inline password (`sshpass`), agent / `~/.ssh/config`, or auto-prompt on failure |
 | **Sudo discovery** | `--sudo` flag for privileged venv/package discovery across all users |
 | **Virtualenv discovery** | venv, pyenv, pipx, Poetry, conda environments |
 | **Lockfile discovery** | `Cargo.lock`, `composer.lock`, `package-lock.json`, `yarn.lock`, `go.sum`, `packages.lock.json`, `pom.xml` |
@@ -38,7 +38,10 @@ cd sbom-toolkit
 # Basic scan with SSH key
 python3 sbom_orchestrator.py --host 10.20.0.5 --user root --key ~/.ssh/id_rsa
 
-# Password auth (requires sshpass)
+# Secure interactive password prompt (never in shell history)
+python3 sbom_orchestrator.py --host 10.20.0.5 --user admin --ask-pass
+
+# Password auth — inline (requires sshpass, visible in history)
 python3 sbom_orchestrator.py --host 10.20.0.5 --user admin --password 'S3cret!'
 
 # Via jump host with sudo for full discovery
@@ -98,7 +101,8 @@ python3 sbom_orchestrator.py --host 10.20.0.5 --user root --skip-trivy
 
 ```
 usage: sbom_orchestrator.py [-h] --host HOST --user USER
-                            [--password PASSWORD] [--key KEY] [--port PORT]
+                            [--password PASSWORD] [--ask-pass] [--key KEY]
+                            [--port PORT]
                             [-J JUMP] [--jump-key JUMP_KEY]
                             [--jump-password JUMP_PASSWORD]
                             [--outdir OUTDIR] [--trivy-proxy TRIVY_PROXY]
@@ -110,7 +114,8 @@ usage: sbom_orchestrator.py [-h] --host HOST --user USER
 |---|---|
 | `--host` | Target hostname or IP (**required**) |
 | `--user` | SSH username (**required**) |
-| `--password` | SSH password (uses `sshpass`) |
+| `--password` | SSH password (uses `sshpass`) — visible in process list/history |
+| `--ask-pass` | Prompt for SSH password interactively (secure — never in history) |
 | `--key` | Path to SSH private key |
 | `--port` | SSH port (default: 22) |
 | `-J`, `--jump` | Jump-host spec: `user@host[:port]` (supports multi-hop with `,`) |
@@ -125,9 +130,11 @@ usage: sbom_orchestrator.py [-h] --host HOST --user USER
 
 ### Authentication Priority
 
-1. **`--password`** → Uses `sshpass -p <password>` (requires `sshpass`).
-2. **`--key`** → Uses `ssh -i <key>`.
-3. **Neither** → Falls back to `ssh-agent` or `~/.ssh/config` (`BatchMode=yes`).
+1. **`--ask-pass`** → Securely prompts for password via `getpass` (never in history/process list).
+2. **`--password`** → Uses `sshpass -p <password>` (requires `sshpass`; visible in process list).
+3. **`--key`** → Uses `ssh -i <key>`.
+4. **Neither** → Falls back to `ssh-agent` or `~/.ssh/config` (`BatchMode=yes`).
+5. **Auto-prompt** → If key/agent auth fails and no password was given, prompts interactively before aborting.
 
 ---
 
