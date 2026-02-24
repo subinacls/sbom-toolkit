@@ -19,6 +19,7 @@ standard library.
 | **Autonomous orchestrator** | One command discovers, extracts, converts, and scans an entire remote host |
 | **SSH jump-host / bastion** | Native `ProxyJump` support — single-hop or multi-hop chains |
 | **Flexible auth** | SSH key, interactive password prompt (`--ask-pass`), inline password (`sshpass`), agent / `~/.ssh/config`, or auto-prompt on failure |
+| **Batch mode** | `--list` flag to audit multiple hosts from a JSON file with global/per-host overrides |
 | **Sudo discovery** | `--sudo` flag for privileged venv/package discovery across all users |
 | **Virtualenv discovery** | venv, pyenv, pipx, Poetry, conda environments |
 | **Lockfile discovery** | `Cargo.lock`, `composer.lock`, `package-lock.json`, `yarn.lock`, `go.sum`, `packages.lock.json`, `pom.xml` |
@@ -54,6 +55,13 @@ python3 sbom_orchestrator.py --host 10.20.0.5 --user root \
 
 # Generate SBOMs only (skip vulnerability scanning)
 python3 sbom_orchestrator.py --host 10.20.0.5 --user root --skip-trivy
+
+# ── Batch mode ──────────────────────────────────────────────
+# Audit multiple hosts from a JSON file
+python3 sbom_orchestrator.py --list hosts.json --user admin --key ~/.ssh/id_rsa --sudo
+
+# Everything defined in the list file itself
+python3 sbom_orchestrator.py --list hosts.json
 ```
 
 ---
@@ -100,9 +108,9 @@ python3 sbom_orchestrator.py --host 10.20.0.5 --user root --skip-trivy
 ## Orchestrator CLI Reference
 
 ```
-usage: sbom_orchestrator.py [-h] --host HOST --user USER
-                            [--password PASSWORD] [--ask-pass] [--key KEY]
-                            [--port PORT]
+usage: sbom_orchestrator.py [-h] (--host HOST | --list FILE)
+                            [--user USER] [--password PASSWORD]
+                            [--ask-pass] [--key KEY] [--port PORT]
                             [-J JUMP] [--jump-key JUMP_KEY]
                             [--jump-password JUMP_PASSWORD]
                             [--outdir OUTDIR] [--trivy-proxy TRIVY_PROXY]
@@ -112,8 +120,9 @@ usage: sbom_orchestrator.py [-h] --host HOST --user USER
 
 | Flag | Description |
 |---|---|
-| `--host` | Target hostname or IP (**required**) |
-| `--user` | SSH username (**required**) |
+| `--host` | Target hostname or IP (single-host mode) |
+| `--list` | Path to a JSON host-list file (batch mode) — mutually exclusive with `--host` |
+| `--user` | SSH username (required for single-host; used as default in batch mode) |
 | `--password` | SSH password (uses `sshpass`) — visible in process list/history |
 | `--ask-pass` | Prompt for SSH password interactively (secure — never in history) |
 | `--key` | Path to SSH private key |
@@ -135,6 +144,45 @@ usage: sbom_orchestrator.py [-h] --host HOST --user USER
 3. **`--key`** → Uses `ssh -i <key>`.
 4. **Neither** → Falls back to `ssh-agent` or `~/.ssh/config` (`BatchMode=yes`).
 5. **Auto-prompt** → If key/agent auth fails and no password was given, prompts interactively before aborting.
+
+### Batch Mode (`--list`)
+
+Pass a JSON file containing multiple hosts to audit in a single run.
+CLI flags act as global defaults; the file's `"defaults"` block can
+override them; per-host fields take highest priority.
+
+**Priority (highest → lowest):**  per-host fields  >  `"defaults"` block  >  CLI flags
+
+#### Host-list file format
+
+```jsonc
+// Full format with defaults + per-host overrides
+{
+  "defaults": {
+    "user": "admin",
+    "key":  "~/.ssh/id_rsa",
+    "sudo": true
+  },
+  "hosts": [
+    { "host": "10.20.0.5" },
+    { "host": "10.20.0.18", "user": "deploy", "key": "~/.ssh/deploy_key" },
+    { "host": "10.30.0.100", "ask_pass": true, "sudo": false }
+  ]
+}
+```
+
+```jsonc
+// Simple array — bare strings or objects
+["10.20.0.5", "10.20.0.18", {"host": "10.30.0.100", "user": "root"}]
+```
+
+#### Supported fields
+
+`host`, `user`, `password`, `ask_pass`, `key`, `port`, `jump`, `jump_key`,
+`jump_password`, `outdir`, `trivy_proxy`, `skip_trivy`, `skip_lang`,
+`skip_lockfiles`, `sudo`
+
+See [hosts_example.json](hosts_example.json) for a ready-to-use template.
 
 ---
 

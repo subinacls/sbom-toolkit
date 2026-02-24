@@ -1,0 +1,34 @@
+{
+  "defaults": {
+    "user": "admin",
+    "key":  "~/.ssh/id_rsa",
+    "port": 22,
+    "sudo": true,
+    "skip_trivy": false
+  },
+  "hosts": [
+    {
+      "host": "10.20.0.5",
+      "_comment": "Uses all defaults — admin + key auth + sudo"
+    },
+    {
+      "host": "10.20.0.18",
+      "user": "deploy",
+      "key":  "~/.ssh/deploy_key",
+      "_comment": "Per-host override: different user and key"
+    },
+    {
+      "host": "10.30.0.100",
+      "ask_pass": true,
+      "sudo": false,
+      "_comment": "Interactive password prompt, no sudo"
+    },
+    {
+      "host": "10.40.0.50",
+      "user": "root",
+      "jump": "bastion@10.20.0.1:2222",
+      "jump_key": "~/.ssh/bastion_key",
+      "_comment": "Via jump host with separate bastion key"
+    }
+  ]
+}

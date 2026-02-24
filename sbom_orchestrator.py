@@ -1105,170 +1105,268 @@ def os_to_converter_args(os_info):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Main orchestrator
+# Host-list file parser
 # ═══════════════════════════════════════════════════════════════════════════
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="SBOM Orchestrator — autonomous remote package discovery, extraction, SBOM generation, and Trivy scanning",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # SSH key auth:
-  %(prog)s --host 10.20.0.5 --user root --key ~/.ssh/id_rsa
+def _resolve_key(key_path):
+    """Expand ``~`` and environment variables in a key path."""
+    if key_path:
+        return str(Path(os.path.expandvars(os.path.expanduser(key_path))).resolve())
+    return None
 
-  # Password auth (prompted securely — password never in shell history):
-  %(prog)s --host 10.20.0.5 --user admin --ask-pass
 
-  # Password auth (inline — less secure, visible in history):
-  %(prog)s --host 10.20.0.5 --user admin --password 'S3cret!'
+def parse_host_list(path):
+    """Parse a host-list file and return ``(defaults, hosts)``.
 
-  # Via a jump/bastion server:
-  %(prog)s --host 10.30.0.100 --user deploy --key ~/.ssh/id_rsa \\
-    --jump bastion_user@10.20.0.1
+    Supported format: **JSON** with the structure::
 
-  # Jump host on a non-standard port with a separate key:
-  %(prog)s --host 10.30.0.100 --user deploy --key ~/.ssh/id_rsa \\
-    --jump bastion@10.20.0.1:2222 --jump-key ~/.ssh/bastion_key
+        {
+          "defaults": {                   // optional — global fallbacks
+            "user": "admin",
+            "key":  "~/.ssh/id_rsa",
+            "port": 22,
+            "sudo": true,
+            ...
+          },
+          "hosts": [
+            // minimal — inherits all defaults
+            { "host": "10.20.0.5" },
 
-  # Multi-hop chain (you → jump1 → jump2 → target):
-  %(prog)s --host 10.50.0.10 --user root --key ~/.ssh/id_rsa \\
-    --jump user1@10.20.0.1,user2@10.30.0.1
+            // full override
+            {
+              "host": "10.20.0.18",
+              "user": "deploy",
+              "key":  "~/.ssh/deploy_key",
+              "password": null,
+              "ask_pass": true,
+              "port": 22,
+              "jump": "bastion@10.20.0.1",
+              "jump_key": null,
+              "jump_password": null,
+              "sudo": false,
+              "skip_trivy": false,
+              "skip_lang": false,
+              "skip_lockfiles": false,
+              "outdir": null,
+              "trivy_proxy": null
+            }
+          ]
+        }
 
-  # Agent / config-based auth (no --key or --password needed):
-  %(prog)s --host 10.20.0.5 --user root
+    Args:
+        path: Filesystem path to the JSON host-list file.
 
-  # Elevate with sudo to read all users' home dirs, pyenv, etc.:
-  %(prog)s --host 10.20.0.5 --user deploy --key ~/.ssh/id_rsa --sudo
+    Returns:
+        Tuple of ``(defaults_dict, list_of_host_dicts)``.
 
-  # Custom output dir + SOCKS proxy for Trivy DB:
-  %(prog)s --host 10.20.0.5 --user root --key ~/.ssh/id_rsa \\
-    --outdir ./results --trivy-proxy socks5://127.0.0.1:1080
-"""
-    )
-    parser.add_argument("--host", required=True, help="Remote host IP or hostname")
-    parser.add_argument("--user", required=True, help="SSH username")
-    parser.add_argument("--password", default=None, help="SSH password (requires sshpass) — visible in process list/history")
-    parser.add_argument("--ask-pass", action="store_true",
-                        help="Prompt for SSH password interactively (secure — never stored in history)")
-    parser.add_argument("--key", default=None, help="Path to SSH private key")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("-J", "--jump", default=None,
-                        help="Jump host(s) for SSH ProxyJump (e.g. user@bastion:port). "
-                             "Chain multiple with commas: user1@h1,user2@h2")
-    parser.add_argument("--jump-key", default=None,
-                        help="SSH private key for the jump host (if different from --key)")
-    parser.add_argument("--jump-password", default=None,
-                        help="Password for the jump host (requires ProxyCommand with sshpass)")
-    parser.add_argument("--outdir", default=None,
-                        help="Output directory (default: ./sbom_<host>_<timestamp>)")
-    parser.add_argument("--trivy-proxy", default=None,
-                        help="Proxy URL for Trivy DB downloads (e.g. socks5://127.0.0.1:1080)")
-    parser.add_argument("--skip-trivy", action="store_true",
-                        help="Generate SBOMs only, skip Trivy scanning")
-    parser.add_argument("--skip-lang", action="store_true",
-                        help="Skip language-level package managers (pip, gem, npm, etc.)")
-    parser.add_argument("--skip-lockfiles", action="store_true",
-                        help="Skip lockfile discovery (Cargo.lock, composer.lock, etc.)")
-    parser.add_argument("--sudo", action="store_true",
-                        help="Use sudo on remote for privileged discovery "
-                             "(read all users' home dirs, pyenv, pipx, etc.)")
-    args = parser.parse_args()
+    Raises:
+        SystemExit: On parse errors or missing required fields.
+    """
+    list_path = Path(path)
+    if not list_path.exists():
+        print(f"FATAL: Host list file not found: {path}", file=sys.stderr)
+        sys.exit(1)
 
-    # ── Interactive password prompt (--ask-pass) ─────────────────────
-    if args.ask_pass:
-        if args.password:
-            print("Warning: --ask-pass overrides --password", file=sys.stderr)
-        args.password = getpass.getpass(
-            prompt=f"SSH password for {args.user}@{args.host}: "
-        )
+    try:
+        data = json.loads(list_path.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"FATAL: Invalid JSON in host list: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-    if not args.password and not args.key:
-        # No explicit key or password — check common defaults, then fall
-        # back to ssh-agent / ~/.ssh/config (the normal SSH behaviour).
+    if isinstance(data, list):
+        # Shorthand: bare list of host objects (no defaults block)
+        data = {"defaults": {}, "hosts": data}
+
+    defaults = data.get("defaults", {})
+    hosts = data.get("hosts", [])
+
+    if not hosts:
+        print("FATAL: Host list contains no hosts", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate every entry has at least a host
+    for idx, entry in enumerate(hosts):
+        if isinstance(entry, str):
+            # Allow plain strings as shorthand: "10.20.0.5"
+            hosts[idx] = {"host": entry}
+            entry = hosts[idx]
+        if "host" not in entry:
+            print(f"FATAL: Host list entry #{idx+1} missing 'host' field: {entry}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    return defaults, hosts
+
+
+def _build_host_cfg(defaults, host_entry, cli_args):
+    """Merge CLI args → list defaults → per-host overrides into one config dict.
+
+    Priority (highest to lowest):
+        1. Per-host fields in the list file.
+        2. ``defaults`` block in the list file.
+        3. CLI flags (global fallbacks).
+
+    Returns:
+        A ``dict`` with all keys needed by :func:`audit_host`.
+    """
+    # Start with CLI values as base
+    cfg = {
+        "host":           None,
+        "user":           cli_args.user,
+        "password":       cli_args.password,
+        "ask_pass":       cli_args.ask_pass,
+        "key":            cli_args.key,
+        "port":           cli_args.port or 22,
+        "jump":           cli_args.jump,
+        "jump_key":       cli_args.jump_key,
+        "jump_password":  cli_args.jump_password,
+        "outdir":         cli_args.outdir,
+        "trivy_proxy":    cli_args.trivy_proxy,
+        "skip_trivy":     cli_args.skip_trivy,
+        "skip_lang":      cli_args.skip_lang,
+        "skip_lockfiles": cli_args.skip_lockfiles,
+        "sudo":           cli_args.sudo,
+    }
+    # Layer list-level defaults
+    for k, v in defaults.items():
+        if v is not None:
+            cfg[k] = v
+    # Layer per-host overrides (highest priority)
+    for k, v in host_entry.items():
+        if v is not None:
+            cfg[k] = v
+
+    # Resolve key paths
+    cfg["key"] = _resolve_key(cfg.get("key"))
+    cfg["jump_key"] = _resolve_key(cfg.get("jump_key"))
+
+    # Validate minimum requirements
+    if not cfg.get("host"):
+        print("FATAL: No host specified", file=sys.stderr)
+        sys.exit(1)
+    if not cfg.get("user"):
+        print(f"FATAL: No user specified for host {cfg['host']}", file=sys.stderr)
+        sys.exit(1)
+
+    return cfg
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Single-host audit engine
+# ═══════════════════════════════════════════════════════════════════════════
+
+def audit_host(cfg, interactive=True):
+    """Run the full SBOM audit pipeline against a single remote host.
+
+    Args:
+        cfg: Configuration dict with keys: host, user, password, ask_pass,
+             key, port, jump, jump_key, jump_password, outdir, trivy_proxy,
+             skip_trivy, skip_lang, skip_lockfiles, sudo.
+        interactive: If ``True``, prompt for a password on auth failure.
+                     Set to ``False`` for unattended batch runs where
+                     ``ask_pass`` was not set.
+
+    Returns:
+        ``0`` on success, ``1`` on failure.
+    """
+    host     = cfg["host"]
+    user     = cfg["user"]
+    password = cfg.get("password")
+    ask_pass = cfg.get("ask_pass", False)
+    key      = cfg.get("key")
+    port     = cfg.get("port", 22)
+    jump     = cfg.get("jump")
+    jump_key = cfg.get("jump_key")
+    jump_password = cfg.get("jump_password")
+    outdir_override = cfg.get("outdir")
+    trivy_proxy    = cfg.get("trivy_proxy")
+    skip_trivy     = cfg.get("skip_trivy", False)
+    skip_lang      = cfg.get("skip_lang", False)
+    skip_lockfiles = cfg.get("skip_lockfiles", False)
+    use_sudo       = cfg.get("sudo", False)
+
+    # ── Interactive password prompt (ask_pass) ────────────────────────
+    if ask_pass:
+        if password:
+            print("Warning: ask_pass overrides password", file=sys.stderr)
+        password = getpass.getpass(prompt=f"SSH password for {user}@{host}: ")
+
+    if not password and not key:
         for default_name in ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"):
             candidate = Path.home() / ".ssh" / default_name
             if candidate.exists():
-                args.key = str(candidate)
-                print(f"Using default SSH key: {args.key}")
+                key = str(candidate)
+                print(f"Using default SSH key: {key}")
                 break
-        if not args.key:
-            # No default key found — rely on ssh-agent or ~/.ssh/config.
-            # This is perfectly valid; SSH will try the agent automatically.
-            print("No --key or --password supplied; relying on ssh-agent / SSH config")
+        if not key:
+            print("No key or password supplied; relying on ssh-agent / SSH config")
 
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if args.outdir:
-        outdir = Path(args.outdir)
+    if outdir_override:
+        outdir = Path(outdir_override)
     else:
-        safe_host = re.sub(r'[^a-zA-Z0-9_.-]', '_', args.host)
+        safe_host = re.sub(r'[^a-zA-Z0-9_.-]', '_', host)
         outdir = Path(f"sbom_{safe_host}_{timestamp}")
     outdir.mkdir(parents=True, exist_ok=True)
-    raw_dir = outdir / "raw"          # raw package listings
-    sbom_dir = outdir / "sbom"        # CycloneDX SBOMs
-    report_dir = outdir / "reports"   # Trivy vulnerability reports
+    raw_dir = outdir / "raw"
+    sbom_dir = outdir / "sbom"
+    report_dir = outdir / "reports"
     raw_dir.mkdir(exist_ok=True)
     sbom_dir.mkdir(exist_ok=True)
     report_dir.mkdir(exist_ok=True)
 
     print("=" * 60)
     print(f"  SBOM Orchestrator")
-    print(f"  Target    : {args.user}@{args.host}:{args.port}")
-    if args.jump:
-        print(f"  Jump via  : {args.jump}")
-    auth_method = 'key' if args.key else ('password' if args.password else 'agent/config')
+    print(f"  Target    : {user}@{host}:{port}")
+    if jump:
+        print(f"  Jump via  : {jump}")
+    auth_method = 'key' if key else ('password' if password else 'agent/config')
     print(f"  Auth      : {auth_method}")
     print(f"  Output    : {outdir}")
-    print(f"  Trivy     : {'skip' if args.skip_trivy else 'enabled'}")
-    print(f"  Sudo      : {'yes' if args.sudo else 'no'}")
+    print(f"  Trivy     : {'skip' if skip_trivy else 'enabled'}")
+    print(f"  Sudo      : {'yes' if use_sudo else 'no'}")
     print("=" * 60)
 
     # ── Connect and test ──────────────────────────────────────────────
     remote = RemoteHost(
-        host=args.host, user=args.user,
-        password=args.password, key=args.key, port=args.port,
-        jump=args.jump, jump_key=args.jump_key,
-        jump_password=args.jump_password,
+        host=host, user=user, password=password, key=key, port=port,
+        jump=jump, jump_key=jump_key, jump_password=jump_password,
     )
 
     print("\n[1/5] Testing SSH connectivity...")
     rc, stdout, stderr = remote.run("echo OK")
     if rc != 0 or "OK" not in stdout:
-        # ── Offer interactive password prompt on failure ───────────
-        if not args.password and not args.ask_pass:
+        if not password and not ask_pass and interactive:
             print(f"  SSH connection failed: {stderr.strip()}")
             print("  Prompting for password (will not be stored in history)...")
             try:
-                pwd = getpass.getpass(
-                    prompt=f"SSH password for {args.user}@{args.host}: "
-                )
+                pwd = getpass.getpass(prompt=f"SSH password for {user}@{host}: ")
             except (EOFError, KeyboardInterrupt):
                 print("\nAborted.", file=sys.stderr)
-                sys.exit(1)
+                return 1
             if pwd:
-                args.password = pwd
+                password = pwd
                 remote = RemoteHost(
-                    host=args.host, user=args.user,
-                    password=args.password, key=args.key, port=args.port,
-                    jump=args.jump, jump_key=args.jump_key,
-                    jump_password=args.jump_password,
+                    host=host, user=user, password=password, key=key,
+                    port=port, jump=jump, jump_key=jump_key,
+                    jump_password=jump_password,
                 )
                 rc, stdout, stderr = remote.run("echo OK")
                 if rc != 0 or "OK" not in stdout:
-                    print(f"FATAL: Cannot connect to {args.host}: {stderr.strip()}",
+                    print(f"FATAL: Cannot connect to {host}: {stderr.strip()}",
                           file=sys.stderr)
-                    sys.exit(1)
+                    return 1
                 auth_method = 'password (interactive)'
                 print(f"  SSH connection successful (password auth)")
             else:
-                print(f"FATAL: Cannot connect to {args.host}: {stderr.strip()}",
+                print(f"FATAL: Cannot connect to {host}: {stderr.strip()}",
                       file=sys.stderr)
-                sys.exit(1)
+                return 1
         else:
-            print(f"FATAL: Cannot connect to {args.host}: {stderr.strip()}",
+            print(f"FATAL: Cannot connect to {host}: {stderr.strip()}",
                   file=sys.stderr)
-            sys.exit(1)
+            return 1
     else:
         print("  SSH connection successful")
 
@@ -1287,26 +1385,24 @@ Examples:
     )
 
     # ── Detect package managers ───────────────────────────────────────
-    # ── Check sudo availability if requested ─────────────────────────
-    if args.sudo:
-        rc, stdout, stderr = remote.run("sudo -n true 2>/dev/null && echo SUDO_OK || echo SUDO_FAIL")
-        if "SUDO_OK" not in stdout:
+    if use_sudo:
+        rc2, stdout2, stderr2 = remote.run("sudo -n true 2>/dev/null && echo SUDO_OK || echo SUDO_FAIL")
+        if "SUDO_OK" not in stdout2:
             print("  WARNING: sudo requested but passwordless sudo not available.")
             print("           Falling back to non-sudo discovery.")
-            print("           To fix: add user to sudoers with NOPASSWD, or SSH as root.")
-            args.sudo = False
+            use_sudo = False
         else:
             print("  sudo      : available (NOPASSWD)")
 
     print("\n[3/5] Detecting package managers...")
-    managers, lockfiles = detect_package_managers(remote, use_sudo=args.sudo)
+    managers, lockfiles = detect_package_managers(remote, use_sudo=use_sudo)
 
     detected = [m for m, present in managers.items() if present]
     print(f"  Managers    : {', '.join(detected) if detected else 'none'}")
     print(f"  Virtualenvs : {len(lockfiles['venvs'])}")
     if lockfiles['pyenv_versions']:
         print(f"  pyenv vers  : {len(lockfiles['pyenv_versions'])}")
-    if not args.skip_lockfiles:
+    if not skip_lockfiles:
         for kind, paths in lockfiles.items():
             if kind != "venvs" and paths:
                 print(f"  {kind:14s}: {len(paths)} found")
@@ -1331,8 +1427,8 @@ Examples:
                 sbom_file=sbom_dir / "sbom_rpm.cdx.json",
                 report_file=report_dir / "trivy_rpm.json",
                 extra_converter_args=extra,
-                trivy_proxy=args.trivy_proxy,
-                skip_trivy=args.skip_trivy,
+                trivy_proxy=trivy_proxy,
+                skip_trivy=skip_trivy,
             )
             if r:
                 results.append(r)
@@ -1354,8 +1450,8 @@ Examples:
                 sbom_file=sbom_dir / "sbom_dpkg.cdx.json",
                 report_file=report_dir / "trivy_dpkg.json",
                 extra_converter_args=extra,
-                trivy_proxy=args.trivy_proxy,
-                skip_trivy=args.skip_trivy,
+                trivy_proxy=trivy_proxy,
+                skip_trivy=skip_trivy,
             )
             if r:
                 results.append(r)
@@ -1375,8 +1471,8 @@ Examples:
                 sbom_file=sbom_dir / "sbom_apk.cdx.json",
                 report_file=report_dir / "trivy_apk.json",
                 extra_converter_args=extra,
-                trivy_proxy=args.trivy_proxy,
-                skip_trivy=args.skip_trivy,
+                trivy_proxy=trivy_proxy,
+                skip_trivy=skip_trivy,
             )
             if r:
                 results.append(r)
@@ -1398,14 +1494,14 @@ Examples:
                 sbom_file=sbom_dir / "sbom_snap.cdx.json",
                 report_file=report_dir / "trivy_snap.json",
                 extra_converter_args=extra,
-                trivy_proxy=args.trivy_proxy,
-                skip_trivy=args.skip_trivy,
+                trivy_proxy=trivy_proxy,
+                skip_trivy=skip_trivy,
             )
             if r:
                 results.append(r)
 
     # ── Language-level package managers ──
-    if not args.skip_lang:
+    if not skip_lang:
 
         # System pip
         if managers["pip"]:
@@ -1419,8 +1515,8 @@ Examples:
                     sbom_file=sbom_dir / "sbom_pip_system.cdx.json",
                     report_file=report_dir / "trivy_pip_system.json",
                     extra_converter_args=["--venv-name", "system"],
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1436,8 +1532,8 @@ Examples:
                     sbom_file=sbom_dir / "sbom_pip_user.cdx.json",
                     report_file=report_dir / "trivy_pip_user.json",
                     extra_converter_args=["--venv-name", "user-site"],
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1459,8 +1555,8 @@ Examples:
                         "--venv-name", venv_name,
                         "--venv-path", venv_path,
                     ],
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1482,8 +1578,8 @@ Examples:
                         "--venv-name", f"conda:{env_name}",
                         "--venv-path", env_path,
                     ],
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1505,8 +1601,8 @@ Examples:
                         "--venv-name", f"pyenv:{ver_name}",
                         "--venv-path", pyenv_path,
                     ],
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1522,8 +1618,8 @@ Examples:
                     pkg_file=pkg_file,
                     sbom_file=sbom_dir / "sbom_gem.cdx.json",
                     report_file=report_dir / "trivy_gem.json",
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1539,14 +1635,14 @@ Examples:
                     pkg_file=pkg_file,
                     sbom_file=sbom_dir / "sbom_npm_global.cdx.json",
                     report_file=report_dir / "trivy_npm_global.json",
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
 
     # ── Lockfile-based extraction ──
-    if not args.skip_lockfiles:
+    if not skip_lockfiles:
 
         # npm/yarn lockfiles
         for lock_path in lockfiles.get("npm_locks", []):
@@ -1560,8 +1656,8 @@ Examples:
                     pkg_file=pkg_file,
                     sbom_file=sbom_dir / f"sbom_npm_{safe}.cdx.json",
                     report_file=report_dir / f"trivy_npm_{safe}.json",
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1578,8 +1674,8 @@ Examples:
                     pkg_file=pkg_file,
                     sbom_file=sbom_dir / f"sbom_go_{safe}.cdx.json",
                     report_file=report_dir / f"trivy_go_{safe}.json",
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1596,8 +1692,8 @@ Examples:
                     pkg_file=pkg_file,
                     sbom_file=sbom_dir / f"sbom_cargo_{safe}.cdx.json",
                     report_file=report_dir / f"trivy_cargo_{safe}.json",
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1614,8 +1710,8 @@ Examples:
                     pkg_file=pkg_file,
                     sbom_file=sbom_dir / f"sbom_composer_{safe}.cdx.json",
                     report_file=report_dir / f"trivy_composer_{safe}.json",
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1632,8 +1728,8 @@ Examples:
                     pkg_file=pkg_file,
                     sbom_file=sbom_dir / f"sbom_nuget_{safe}.cdx.json",
                     report_file=report_dir / f"trivy_nuget_{safe}.json",
-                    trivy_proxy=args.trivy_proxy,
-                    skip_trivy=args.skip_trivy,
+                    trivy_proxy=trivy_proxy,
+                    skip_trivy=skip_trivy,
                 )
                 if r:
                     results.append(r)
@@ -1651,8 +1747,8 @@ Examples:
                         pkg_file=pkg_file,
                         sbom_file=sbom_dir / f"sbom_maven_{safe}.cdx.json",
                         report_file=report_dir / f"trivy_maven_{safe}.json",
-                        trivy_proxy=args.trivy_proxy,
-                        skip_trivy=args.skip_trivy,
+                        trivy_proxy=trivy_proxy,
+                        skip_trivy=skip_trivy,
                     )
                     if r:
                         results.append(r)
@@ -1661,7 +1757,7 @@ Examples:
     print("\n" + "=" * 60)
     print("  SCAN SUMMARY")
     print("=" * 60)
-    print(f"  Host           : {args.user}@{args.host}")
+    print(f"  Host           : {user}@{host}")
     print(f"  OS             : {os_info.get('PRETTY_NAME', 'unknown')}")
     print(f"  Output dir     : {outdir}")
     print(f"  Sources scanned: {len(results)}")
@@ -1686,14 +1782,14 @@ Examples:
     print(f"\n  Output files:")
     print(f"    Raw packages : {raw_dir}/")
     print(f"    SBOM files   : {sbom_dir}/")
-    if not args.skip_trivy:
+    if not skip_trivy:
         print(f"    Trivy reports: {report_dir}/")
     print("=" * 60)
 
     # Write summary JSON
     summary = {
-        "host": args.host,
-        "user": args.user,
+        "host": host,
+        "user": user,
         "timestamp": datetime.now().isoformat(),
         "os": os_info,
         "results": results,
@@ -1708,6 +1804,170 @@ Examples:
     print(f"\n  Summary written to: {summary_file}")
 
     return 0 if results else 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main — CLI entry point with --list support
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SBOM Orchestrator — autonomous remote package discovery, "
+                    "extraction, SBOM generation, and Trivy scanning",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # ── Single-host mode ────────────────────────────────────────
+  %(prog)s --host 10.20.0.5 --user root --key ~/.ssh/id_rsa
+  %(prog)s --host 10.20.0.5 --user admin --ask-pass
+  %(prog)s --host 10.20.0.5 --user admin --password 'S3cret!'
+  %(prog)s --host 10.30.0.100 --user deploy -J bastion@10.20.0.1 --sudo
+
+  # ── Batch mode (host list file) ────────────────────────────
+  # Global user/key, per-host overrides in JSON:
+  %(prog)s --list hosts.json --user admin --key ~/.ssh/id_rsa --sudo
+
+  # Minimal — everything defined in the list file:
+  %(prog)s --list hosts.json
+
+Host-list file format (JSON):
+  {
+    "defaults": {
+      "user": "admin",
+      "key":  "~/.ssh/id_rsa",
+      "sudo": true
+    },
+    "hosts": [
+      { "host": "10.20.0.5" },
+      { "host": "10.20.0.18", "user": "deploy", "key": "~/.ssh/deploy_key" },
+      { "host": "10.30.0.100", "ask_pass": true, "sudo": false }
+    ]
+  }
+
+  Or a simple array of host strings / objects:
+  ["10.20.0.5", "10.20.0.18", {"host": "10.30.0.100", "user": "root"}]
+
+Priority (highest → lowest):
+  per-host fields  >  "defaults" block  >  CLI flags
+"""
+    )
+
+    # ── Target selection (mutually exclusive) ─────────────────────────
+    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("--host", default=None,
+                              help="Remote host IP or hostname (single-host mode)")
+    target_group.add_argument("--list", default=None, metavar="FILE",
+                              help="Path to a JSON host-list file (batch mode)")
+
+    # ── Auth / connection ─────────────────────────────────────────────
+    parser.add_argument("--user", default=None,
+                        help="SSH username (required for single-host; default for batch)")
+    parser.add_argument("--password", default=None,
+                        help="SSH password (requires sshpass) — visible in process list/history")
+    parser.add_argument("--ask-pass", action="store_true",
+                        help="Prompt for SSH password interactively (secure — never stored in history)")
+    parser.add_argument("--key", default=None,
+                        help="Path to SSH private key")
+    parser.add_argument("--port", type=int, default=22,
+                        help="SSH port (default: 22)")
+    parser.add_argument("-J", "--jump", default=None,
+                        help="Jump host(s) for SSH ProxyJump (e.g. user@bastion:port)")
+    parser.add_argument("--jump-key", default=None,
+                        help="SSH private key for the jump host")
+    parser.add_argument("--jump-password", default=None,
+                        help="Password for the jump host")
+
+    # ── Output / scanning ─────────────────────────────────────────────
+    parser.add_argument("--outdir", default=None,
+                        help="Output directory (default: ./sbom_<host>_<timestamp>)")
+    parser.add_argument("--trivy-proxy", default=None,
+                        help="Proxy URL for Trivy DB downloads")
+    parser.add_argument("--skip-trivy", action="store_true",
+                        help="Generate SBOMs only, skip Trivy scanning")
+    parser.add_argument("--skip-lang", action="store_true",
+                        help="Skip language-level package managers")
+    parser.add_argument("--skip-lockfiles", action="store_true",
+                        help="Skip lockfile discovery")
+    parser.add_argument("--sudo", action="store_true",
+                        help="Use sudo for privileged discovery")
+
+    args = parser.parse_args()
+
+    # ── Single-host mode ──────────────────────────────────────────────
+    if args.host:
+        if not args.user:
+            parser.error("--user is required in single-host mode")
+
+        cfg = {
+            "host":           args.host,
+            "user":           args.user,
+            "password":       args.password,
+            "ask_pass":       args.ask_pass,
+            "key":            _resolve_key(args.key),
+            "port":           args.port,
+            "jump":           args.jump,
+            "jump_key":       _resolve_key(args.jump_key),
+            "jump_password":  args.jump_password,
+            "outdir":         args.outdir,
+            "trivy_proxy":    args.trivy_proxy,
+            "skip_trivy":     args.skip_trivy,
+            "skip_lang":      args.skip_lang,
+            "skip_lockfiles": args.skip_lockfiles,
+            "sudo":           args.sudo,
+        }
+        return audit_host(cfg, interactive=True)
+
+    # ── Batch mode (--list) ───────────────────────────────────────────
+    defaults, hosts = parse_host_list(args.list)
+
+    total = len(hosts)
+    succeeded = 0
+    failed = 0
+    failed_hosts = []
+
+    print("=" * 60)
+    print(f"  SBOM Orchestrator — Batch Mode")
+    print(f"  Hosts     : {total}")
+    print(f"  List file : {args.list}")
+    if defaults:
+        print(f"  Defaults  : {json.dumps(defaults, default=str)}")
+    print("=" * 60)
+
+    for idx, host_entry in enumerate(hosts, 1):
+        cfg = _build_host_cfg(defaults, host_entry, args)
+        host_label = f"{cfg.get('user', '?')}@{cfg['host']}"
+
+        print(f"\n{'━' * 60}")
+        print(f"  [{idx}/{total}] {host_label}")
+        print(f"{'━' * 60}")
+
+        try:
+            # In batch mode, only prompt interactively if ask_pass is set
+            # for that host (avoid blocking the batch on prompts).
+            interactive = cfg.get("ask_pass", False)
+            rc = audit_host(cfg, interactive=interactive)
+            if rc == 0:
+                succeeded += 1
+            else:
+                failed += 1
+                failed_hosts.append(cfg["host"])
+        except Exception as exc:
+            print(f"  ERROR: {exc}", file=sys.stderr)
+            failed += 1
+            failed_hosts.append(cfg["host"])
+
+    # ── Batch summary ─────────────────────────────────────────────────
+    print(f"\n{'━' * 60}")
+    print(f"  BATCH SUMMARY")
+    print(f"{'━' * 60}")
+    print(f"  Total hosts : {total}")
+    print(f"  Succeeded   : {succeeded}")
+    print(f"  Failed      : {failed}")
+    if failed_hosts:
+        print(f"  Failed list : {', '.join(failed_hosts)}")
+    print(f"{'━' * 60}")
+
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
